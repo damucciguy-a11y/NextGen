@@ -261,6 +261,7 @@ canvas#confetti{position:fixed;inset:0;pointer-events:none;z-index:11}
           <div class="muted" style="font-weight:700">JOIN CODE</div>
           <div class="code big" id="hostCode">----</div>
           <div class="muted" style="font-size:15px">Open <b class="siteUrl"></b> → <b>Join a game</b> → enter the code</div>
+          <div class="muted" style="font-size:13px;margin-top:8px">📺 Keep this screen open and in front. If you switch apps on this device, players can't join.</div>
         </div>
         <div class="panel">
           <div class="phead"><h2>Who's here <span id="lobbyCount" class="muted" style="font-size:18px"></span></h2></div>
@@ -472,7 +473,26 @@ function revealHTML(list){
 
 // ================= connection layer (MQTT relay) =================
 // All devices talk through a free public MQTT relay over secure WebSockets (works on any network).
-const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
+const BROKERS=['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081/mqtt'];
+// one "link" = a connection to every server. Sends go out on all of them; repeats are dropped by message id.
+function makeLink({sub,onMsg,will,onChange}){
+  const clients=BROKERS.map(url=>{
+    const c=mqtt.connect(url,{clientId:'bn_'+rid(),clean:true,reconnectPeriod:3000,connectTimeout:12000,keepalive:30,...(will?{will:{topic:will.topic,payload:will.payload,qos:0,retain:false}}:{})});
+    c.on('connect',()=>{if(link.dead)return;c.subscribe(sub,{qos:1},()=>onChange&&onChange('sub'));onChange&&onChange('up')});
+    c.on('message',(t,buf)=>{if(link.dead)return;const d=parseMsg(buf);if(!d)return;
+      if(d.mid){if(link.seen.has(d.mid))return;link.seen.set(d.mid,Date.now());if(link.seen.size>800){const cut=Date.now()-180000;for(const[k,v]of link.seen)if(v<cut)link.seen.delete(k)}}
+      try{onMsg(d)}catch(e){console.warn(e)}});
+    c.on('offline',()=>{if(!link.dead)onChange&&onChange('down')});c.on('close',()=>{if(!link.dead)onChange&&onChange('down')});
+    c.on('error',()=>{});return c});
+  const link={clients,dead:false,seen:new Map(),
+    get connected(){return clients.some(c=>c.connected)},
+    get count(){return clients.filter(c=>c.connected).length},
+    publish(t,p,o){let ok=false;clients.forEach(c=>{if(c.connected)try{c.publish(t,p,o);ok=true}catch(e){}});return ok},
+    reconnect(){clients.forEach(c=>{try{if(!c.connected)c.reconnect()}catch(e){}})},
+    end(f){link.dead=true;clients.forEach(c=>{try{c.end(f)}catch(e){}})}};
+  return link;
+}
+const srvText=l=>l?`${l.count}/${BROKERS.length} servers`:'';
 const NS='bingonight-nm7/';
 const libOK=()=>typeof mqtt!=='undefined';
 const rid=()=>Math.random().toString(36).slice(2,10);
@@ -517,23 +537,13 @@ function startHost(state,resuming){
   openHostPeer();
 }
 // the host connects to BOTH servers at once, so a phone on either one can play
-function makeHostLink(){
-  const code=H.code,clients=BROKERS.map(url=>{
-    const c=mqtt.connect(url,{clientId:'bnh_'+rid(),clean:true,reconnectPeriod:3000,connectTimeout:12000,keepalive:30});
-    c.on('connect',()=>{if(hostMq!==link)return;c.subscribe(NS+code+'/up',{qos:1});setStatus(true,'Live');broadcast(true);renderPlayers()});
-    c.on('message',(topic,buf)=>{if(hostMq!==link)return;const d=parseMsg(buf);if(d)try{onPlayerMsg(d)}catch(e){console.warn(e)}});
-    c.on('offline',()=>{if(hostMq===link&&!link.connected)setStatus(false,'Offline — retrying…')});
-    c.on('error',()=>{});return c});
-  const link={clients,get connected(){return clients.some(c=>c.connected)},
-    publish(t,p,o){clients.forEach(c=>{if(c.connected)try{c.publish(t,p,o)}catch(e){}})},
-    reconnect(){clients.forEach(c=>{try{if(!c.connected)c.reconnect()}catch(e){}})},
-    end(f){clients.forEach(c=>{try{c.end(f)}catch(e){}})}};
-  return link;
-}
 function openHostPeer(){
   setStatus(false,'Opening game…');$('#hostCode').textContent=H.code;
   try{hostMq&&hostMq.end(true)}catch(e){}
-  const c=makeHostLink();hostMq=c;
+  const code=H.code;
+  const c=makeLink({sub:NS+code+'/up',onMsg:d=>{if(hostMq===c&&H&&H.code===code)onPlayerMsg(d)},
+    onChange:ev=>{if(hostMq!==c)return;if(ev==='up'){broadcast(true)}hostStatus()}});
+  hostMq=c;
   clearInterval(hostBeat);
   hostBeat=setInterval(()=>{ // heartbeat: refresh everyone + mark silent players offline
     if(!H||hostMq!==c)return;const now=Date.now();let ch=false;
@@ -541,7 +551,9 @@ function openHostPeer(){
     if(ch)renderPlayers();broadcast(true);
   },15000);
 }
-function sendTo(pid,obj,retain){if(hostMq&&hostMq.connected&&H){try{hostMq.publish(NS+H.code+'/to/'+pid,JSON.stringify(obj),{qos:1,retain:!!retain})}catch(e){}}}
+function sendTo(pid,obj,retain){if(hostMq&&hostMq.connected&&H){try{hostMq.publish(NS+H.code+'/to/'+pid,JSON.stringify({mid:rid(),...obj}),{qos:1,retain:!!retain})}catch(e){}}}
+function hostStatus(){if(!H||!hostMq)return;const online=Object.values(players).filter(p=>p.online).length;
+  if(hostMq.connected)setStatus(true,`Live · ${online} player${online===1?'':'s'} · ${srvText(hostMq)}`);else setStatus(false,'Connecting to game servers…')}
 function payloadFor(pid){
   const voteCounts={};
   if(H.punish)Object.entries(H.punish.votes).forEach(([t,vs])=>{voteCounts[t]={};Object.values(vs).forEach(i=>{voteCounts[t][i]=(voteCounts[t][i]||0)+1})});
@@ -582,7 +594,7 @@ function onPlayerMsg(d){
   if(!d||typeof d!=='object'||!H)return;
   if(typeof d.mid==='string'){if(seenMids.has(d.mid))return;seenMids.set(d.mid,Date.now());if(seenMids.size>500){const cut=Date.now()-120000;for(const[k,t]of seenMids)if(t<cut)seenMids.delete(k)}}
   const pid=typeof d.pid==='string'&&/^[a-z0-9]{4,40}$/i.test(d.pid)?d.pid:null;if(!pid)return;
-  if(d.t==='bye'){if(players[pid]){players[pid].online=false;renderPlayers();broadcast()}return}
+  if(d.t==='bye'){const p=players[pid];if(p&&!(d.will&&Date.now()-(p.seen||0)<25000)){p.online=false;renderPlayers();broadcast()}return}
   if(d.t==='hello'||d.t==='update'||d.t==='ping'){
     const wasOnline=players[pid]&&players[pid].online;
     const prev=players[pid]||{};
@@ -732,7 +744,7 @@ $('#settingsBtn').onclick=()=>{stopAuto();hostView='lobby';renderStage();scrollT
 function endHostGame(){
   stopAuto();clearInterval(hostBeat);clearTimeout(bcastT);bcastT=null;const c=hostMq,code=H.code,ids=Object.keys(players);
   // tell everyone, then clear the saved (retained) game state so the code is free again
-  ids.forEach(pid=>{try{c&&c.publish(NS+code+'/to/'+pid,JSON.stringify({t:'ended',ts:Date.now()}),{qos:1,retain:true})}catch(e){}});
+  ids.forEach(pid=>{try{c&&c.publish(NS+code+'/to/'+pid,JSON.stringify({t:'ended',mid:rid(),ts:Date.now()}),{qos:1,retain:true})}catch(e){}});
   setTimeout(()=>{ids.forEach(pid=>{try{c&&c.publish(NS+code+'/to/'+pid,'',{qos:1,retain:true})}catch(e){}});setTimeout(()=>{try{c&&c.end()}catch(e){}},800)},1500);
   hostMq=null;players={};keepAwake(false);
   store.del('host');H=null;$('#resumeHost').style.display='none';setStatus(false,'Ready');show('home');
@@ -745,7 +757,7 @@ function renderPlayers(){
   $('#pcount').textContent=list.length?`(${online} online)`:'';
   $('#lobbyCount').textContent=online?`(${online})`:'';
   $('#lobbyPlayers').innerHTML=list.length?list.map(([,p])=>`<span class="chip ${p.online?'':'off'}">${esc(p.name)}</span>`).join(''):'<div class="emptyp">Waiting for players to join…</div>';
-  if(hostMq&&hostMq.connected)setStatus(true,`Live · ${online} connected`);
+  hostStatus();
   if(!list.length){el.innerHTML='<div class="emptyp">Waiting for players to join…</div>'}
   else{
     const rows=list.map(([pid,p])=>{const ok=p.card>=1000&&p.card<=9999&&p.round===H.round;const need=ok?away(marksFor(pid,p),H.pattern):'–';const pen=penOf(pid);p._pen=pen?(pen.benchUntil>H.called.length?' · 🪑':'')+(pen.locked.length||pen.pendingLock?' · 🔒':''):'';return{pid,p,need,pts:(H.scores[pid]||{}).pts||0}})
@@ -832,28 +844,24 @@ function joinGame(){
   store.set('player',P);joined=true;joinedAt=Date.now();G=null;seenState=false;lastCalledLen=0;lastSeenN=null;shownAward=null;keepAwake(true);
   show('player');$('#pname').textContent=P.name;$('#ppts').textContent='';$('#pgame').textContent='Game '+code;$('#ppat').textContent='';
   showPlayerPane('wait');$('#pwaitText').textContent='Connecting…';
-  brokerIdx=0;connectPlayer();
+  connectPlayer();
   clearTimeout(retryT);retryT=setTimeout(function chk(){
     if(!joined||seenState)return;const c=pMq;
-    $('#pwaitText').innerHTML=c&&c.connected?`No game found with code <b>${esc(P.code)}</b> yet.<br><span class="muted">Check the code, and make sure the host screen is open. Still looking…</span>`
+    $('#pwaitText').innerHTML=c&&c.connected?`No game found with code <b>${esc(P.code)}</b> yet.<br><span class="muted">Check the code matches the host screen, and keep the host screen open in front (if the host switches apps, the game pauses). Still looking… (${srvText(c)})</span>`
       :`Can't reach the game server.<br><span class="muted">Check your internet connection. Still trying…</span>`;
     sayHello();retryT=setTimeout(chk,4000);
   },7000);
   clearInterval(beatT);beatT=setInterval(()=>{if(joined&&P)send({t:'ping',...myInfo()})},15000);
 }
-let brokerIdx=0,failT=null;
 function connectPlayer(){
   try{pMq&&pMq.end(true)}catch(e){}
-  const code2=P.code,c=mqtt.connect(BROKERS[brokerIdx%BROKERS.length],{clientId:'bnp_'+rid(),clean:true,reconnectPeriod:2000,connectTimeout:12000,keepalive:30,
-    will:{topic:NS+code2+'/up',payload:JSON.stringify({t:'bye',pid:myPid}),qos:0,retain:false}});
+  const code2=P.code;
+  const c=makeLink({sub:NS+code2+'/to/'+myPid,will:{topic:NS+code2+'/up',payload:JSON.stringify({t:'bye',pid:myPid,will:1})},
+    onMsg:d=>{if(pMq===c)onHostMsg(d)},
+    onChange:ev=>{if(pMq!==c)return;if(ev==='sub')sayHello();
+      if(c.connected)setStatus(true,`Connected · ${srvText(c)}`);else setStatus(false,'Reconnecting…');
+      if(!seenState&&ev!=='down')$('#pwaitText').textContent=`Connected to ${srvText(c)} — looking for the game…`}});
   pMq=c;
-  clearTimeout(failT);failT=setTimeout(function fo(){if(!joined||pMq!==c)return;if(!c.connected){brokerIdx++;connectPlayer()}},9000);
-  c.on('connect',()=>{if(pMq!==c)return;clearTimeout(failT);setStatus(true,'Connected');c.subscribe(NS+code2+'/to/'+myPid,{qos:1},()=>sayHello())});
-  c.on('message',(t,buf)=>{if(pMq!==c)return;const d=parseMsg(buf);if(d)try{onHostMsg(d)}catch(e){console.warn(e)}});
-  c.on('reconnect',()=>{if(pMq===c)setStatus(false,'Reconnecting…')});
-  c.on('offline',()=>{if(pMq!==c)return;setStatus(false,'Offline — retrying…');
-    clearTimeout(failT);failT=setTimeout(()=>{if(joined&&pMq===c&&!c.connected&&navigator.onLine!==false){brokerIdx++;connectPlayer()}},12000)});
-  c.on('error',()=>{});
 }
 function sayHello(){if(joined&&P)send({t:'hello',...myInfo()})}
 function send(m){if(pMq&&pMq.connected&&P){try{pMq.publish(NS+P.code+'/up',JSON.stringify({pid:myPid,mid:rid(),...m}),{qos:1});return true}catch(e){}}return false}
@@ -979,7 +987,7 @@ $('#bingoBtn').onclick=()=>{
 };
 $('#newCardBtn').onclick=()=>{if(G&&G.called.length)return;P.card=newCardId();P.dabs=Array(25).fill(false);P.pendingCard=P.card;store.set('player',P);send({t:'update',...myInfo(),newCard:true});renderCard()};
 $('#leaveBtn').onclick=leaveGame;$('#lobbyLeave').onclick=leaveGame;$('#waitLeave').onclick=leaveGame;
-function leaveGame(){send({t:'bye'});joined=false;clearTimeout(failT);keepAwake(false);$('#flash').classList.remove('on');$('#overlay').classList.remove('on');clearTimeout(retryT);clearInterval(beatT);const c=pMq;pMq=null;setTimeout(()=>{try{c&&c.end()}catch(e){}},300);G=null;seenState=false;setStatus(false,'Ready');show('home')}
+function leaveGame(){send({t:'bye'});joined=false;keepAwake(false);$('#flash').classList.remove('on');$('#overlay').classList.remove('on');clearTimeout(retryT);clearInterval(beatT);const c=pMq;pMq=null;setTimeout(()=>{try{c&&c.end()}catch(e){}},300);G=null;seenState=false;setStatus(false,'Ready');show('home')}
 
 </script>
 </body>
