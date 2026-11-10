@@ -594,7 +594,11 @@ function onPlayerMsg(d){
   if(!d||typeof d!=='object'||!H)return;
   if(typeof d.mid==='string'){if(seenMids.has(d.mid))return;seenMids.set(d.mid,Date.now());if(seenMids.size>500){const cut=Date.now()-120000;for(const[k,t]of seenMids)if(t<cut)seenMids.delete(k)}}
   const pid=typeof d.pid==='string'&&/^[a-z0-9]{4,40}$/i.test(d.pid)?d.pid:null;if(!pid)return;
-  if(d.t==='bye'){const p=players[pid];if(p&&!(d.will&&Date.now()-(p.seen||0)<25000)){p.online=false;renderPlayers();broadcast()}return}
+  if(d.t==='bye'){const p=players[pid];if(!p||!p.online)return;
+    if(!d.will){p.online=false;renderPlayers();broadcast();return}
+    // a server says this phone dropped — it may still be on another server, so ask it directly
+    const asked=Date.now();p.checkAt=asked;sendTo(pid,{t:'check'});
+    setTimeout(()=>{if(players[pid]===p&&p.checkAt===asked&&(p.seen||0)<asked&&p.online){p.online=false;renderPlayers();broadcast()}},6000);return}
   if(d.t==='hello'||d.t==='update'||d.t==='ping'){
     const wasOnline=players[pid]&&players[pid].online;
     const prev=players[pid]||{};
@@ -884,6 +888,7 @@ function onHostMsg(d){
     if(d.penalty==='swap'&&d.card>=1000){P.card=+d.card;P.dabs=Array(25).fill(false);store.set('player',P);renderCard()}
     try{navigator.vibrate&&navigator.vibrate([80,60,80])}catch(e){}
     popup('❌ FALSE BINGO',(d.penalty?PEN_TEXT[d.penalty]+' ':'')+'You\'re also on the False Bingo list… everyone votes on your punishment at the end 😈',d.count>1?`Strike ${d.count}!`:'',false);return}
+  if(d.t==='check'){send({t:'ping',...myInfo()});return}
   if(d.t==='msg'){toast(String(d.text||'').slice(0,120));return}
   if(d.t==='ended'){if(d.ts&&d.ts<joinedAt-2000)return; // left over from before we joined
     toast('The host ended the game');leaveGame()}
